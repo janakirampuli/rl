@@ -1,36 +1,71 @@
+"""Generic tabular Q-learning trainer/evaluator with TensorBoard + GIF export.
+
+Works for discrete-state/discrete-action Gymnasium environments
+(example: FrozenLake-v1, Taxi-v3).
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
 from PIL import Image
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from torch.utils.tensorboard import SummaryWriter
+
+DEFAULT_ENV_ID = "FrozenLake-v1"
 
 
-ENV_ID = "FrozenLake-v1"
-DEFAULT_MAP_NAME = "8x8"
-DEFAULT_MODEL_PATH = Path("models/qtable_frozenlake.npy")
-DEFAULT_GIF_PATH = Path("videos/frozenlake_test.gif")
-DEFAULT_LOG_DIR = Path("logs/frozenlake_qlearning")
+def env_slug(env_id: str) -> str:
+    """Create filesystem-safe slug from env id."""
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", env_id).strip("_").lower()
 
 
-def build_env(map_name: str, is_slippery: bool, render_mode: str | None = None):
-    """Create FrozenLake env."""
-    env = gym.make(
-        ENV_ID,
-        map_name=map_name,
-        is_slippery=is_slippery,
-        render_mode=render_mode,
-    )
+def parse_env_kwargs(raw: str) -> dict[str, Any]:
+    """Parse JSON env kwargs passed from CLI."""
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid --env-kwargs JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("--env-kwargs must be a JSON object, e.g. '{\"map_name\": \"8x8\"}'.")
+    return data
+
+
+def normalize_model_path(path: Path) -> Path:
+    """Ensure model path has .npy extension."""
+    return path if path.suffix == ".npy" else path.with_suffix(".npy")
+
+
+def build_env(
+    env_id: str,
+    env_kwargs: dict[str, Any],
+    render_mode: str | None = None,
+) -> gym.Env:
+    """Create a discrete Gymnasium environment."""
+    kwargs = dict(env_kwargs)
+    if render_mode is not None:
+        kwargs["render_mode"] = render_mode
+
+    env = gym.make(env_id, **kwargs)
     if not isinstance(env.observation_space, gym.spaces.Discrete):
-        raise TypeError("This script expects a discrete observation space.")
+        raise TypeError(
+            f"Unsupported observation space for tabular Q-learning: {env.observation_space}. "
+            "Need gym.spaces.Discrete."
+        )
     if not isinstance(env.action_space, gym.spaces.Discrete):
-        raise TypeError("This script expects a discrete action space.")
+        raise TypeError(
+            f"Unsupported action space for tabular Q-learning: {env.action_space}. "
+            "Need gym.spaces.Discrete."
+        )
     return env
 
 
@@ -55,15 +90,14 @@ def epsilon_greedy_policy(
 
 
 def evaluate_agent(
+    env: gym.Env,
     q_table: np.ndarray,
-    map_name: str,
-    is_slippery: bool,
     max_steps: int,
     episodes: int,
     seed: int,
+    success_threshold: float,
 ) -> tuple[float, float, float, float]:
-    """Evaluate greedy policy and return mean/std reward, success rate, mean ep length."""
-    env = build_env(map_name=map_name, is_slippery=is_slippery, render_mode=None)
+    """Evaluate greedy policy and return mean/std reward, success rate, mean episode length."""
     rewards: list[float] = []
     successes: list[float] = []
     lengths: list[int] = []
@@ -80,15 +114,14 @@ def evaluate_agent(
 
             if terminated or truncated:
                 lengths.append(step)
-                successes.append(1.0 if reward > 0 else 0.0)
                 break
         else:
+            # Runs only if loop did NOT break (episode hit max_steps exactly).
             lengths.append(max_steps)
-            successes.append(0.0)
 
         rewards.append(total_reward)
+        successes.append(1.0 if total_reward >= success_threshold else 0.0)
 
-    env.close()
     return (
         float(np.mean(rewards)),
         float(np.std(rewards)),
@@ -97,26 +130,38 @@ def evaluate_agent(
     )
 
 
-def save_q_table(q_table: np.ndarray, model_path: Path, metadata: dict | None = None) -> None:
+def save_q_table(q_table: np.ndarray, model_path: Path, metadata: dict[str, Any] | None = None) -> None:
+    model_path = normalize_model_path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(model_path, q_table)
-    if metadata:
-        meta_path = model_path.with_suffix(".json")
-        meta_path.write_text(json.dumps(metadata, indent=2))
+    if metadata is not None:
+        model_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2))
 
 
 def load_q_table(model_path: Path) -> np.ndarray:
+    model_path = normalize_model_path(model_path)
     if not model_path.exists():
-        raise FileNotFoundError(
-            f"Q-table not found at: {model_path}. Train first with --train."
-        )
+        raise FileNotFoundError(f"Q-table not found at: {model_path}. Train first with --train.")
     q_table = np.load(model_path)
     if q_table.ndim != 2:
         raise ValueError(f"Invalid Q-table shape: {q_table.shape}")
     return q_table.astype(np.float32)
 
 
+def validate_q_table_shape(q_table: np.ndarray, env: gym.Env) -> None:
+    expected_shape = (env.observation_space.n, env.action_space.n)
+    if q_table.shape != expected_shape:
+        raise ValueError(
+            f"Q-table shape {q_table.shape} does not match env shape {expected_shape}. "
+            "Use the correct --env-id/--env-kwargs or retrain the table."
+        )
+
+
 def train(
+    env: gym.Env,
+    eval_env: gym.Env,
+    env_id: str,
+    env_kwargs: dict[str, Any],
     episodes: int,
     learning_rate: float,
     gamma: float,
@@ -124,22 +169,22 @@ def train(
     max_epsilon: float,
     decay_rate: float,
     max_steps: int,
-    map_name: str,
-    is_slippery: bool,
     model_path: Path,
     log_dir: Path,
     eval_freq: int,
     checkpoint_freq: int,
     eval_episodes: int,
     seed: int,
+    success_threshold: float,
 ) -> np.ndarray:
     """Train Q-learning agent with TensorBoard tracking."""
-    env = build_env(map_name=map_name, is_slippery=is_slippery, render_mode=None)
     state_space = env.observation_space.n
     action_space = env.action_space.n
     q_table = initialize_q_table(state_space, action_space)
 
+    model_path = normalize_model_path(model_path)
     log_dir.mkdir(parents=True, exist_ok=True)
+
     writer = SummaryWriter(log_dir=str(log_dir))
     rng = np.random.default_rng(seed)
 
@@ -147,14 +192,13 @@ def train(
     success_window: list[float] = []
     best_eval_reward = -np.inf
 
-    pbar = tqdm(range(1, episodes + 1), desc="Training Q-learning")
+    pbar = tqdm(range(1, episodes + 1), desc=f"Training Q-learning ({env_id})")
     for episode in pbar:
         epsilon = min_epsilon + (max_epsilon - min_epsilon) * np.exp(-decay_rate * (episode - 1))
 
         state, _ = env.reset(seed=seed + episode)
         total_reward = 0.0
         td_errors: list[float] = []
-        success = 0.0
 
         for step in range(1, max_steps + 1):
             action = epsilon_greedy_policy(q_table, int(state), epsilon, rng, action_space)
@@ -165,15 +209,17 @@ def train(
             td_target = float(reward) + gamma * best_next_q
             td_error = td_target - float(q_table[int(state), action])
             q_table[int(state), action] += learning_rate * td_error
-            td_errors.append(abs(td_error))
 
+            td_errors.append(abs(td_error))
             state = new_state
             total_reward += float(reward)
 
             if done:
-                success = 1.0 if reward > 0 else 0.0
                 break
+        else:
+            step = max_steps
 
+        success = 1.0 if total_reward >= success_threshold else 0.0
         reward_window.append(total_reward)
         success_window.append(success)
         if len(reward_window) > 100:
@@ -203,12 +249,12 @@ def train(
 
         if eval_freq > 0 and episode % eval_freq == 0:
             mean_reward, std_reward, success_rate, mean_ep_len = evaluate_agent(
+                env=eval_env,
                 q_table=q_table,
-                map_name=map_name,
-                is_slippery=is_slippery,
                 max_steps=max_steps,
                 episodes=eval_episodes,
                 seed=seed + 10_000,
+                success_threshold=success_threshold,
             )
             writer.add_scalar("eval/mean_reward", mean_reward, episode)
             writer.add_scalar("eval/std_reward", std_reward, episode)
@@ -221,30 +267,25 @@ def train(
                     q_table,
                     model_path.with_name(model_path.stem + "_best.npy"),
                     metadata={
-                        "env_id": ENV_ID,
-                        "map_name": map_name,
-                        "is_slippery": is_slippery,
+                        "env_id": env_id,
+                        "env_kwargs": env_kwargs,
                         "best_eval_mean_reward": best_eval_reward,
                         "episode": episode,
                     },
                 )
 
         if checkpoint_freq > 0 and episode % checkpoint_freq == 0:
-            checkpoint_path = model_path.with_name(
-                f"{model_path.stem}_ep{episode}.npy"
-            )
+            checkpoint_path = model_path.with_name(f"{model_path.stem}_ep{episode}.npy")
             save_q_table(q_table, checkpoint_path)
 
     writer.close()
-    env.close()
 
     save_q_table(
         q_table,
         model_path,
         metadata={
-            "env_id": ENV_ID,
-            "map_name": map_name,
-            "is_slippery": is_slippery,
+            "env_id": env_id,
+            "env_kwargs": env_kwargs,
             "episodes": episodes,
             "learning_rate": learning_rate,
             "gamma": gamma,
@@ -253,6 +294,7 @@ def train(
             "decay_rate": decay_rate,
             "max_steps": max_steps,
             "seed": seed,
+            "success_threshold": success_threshold,
         },
     )
     print(f"Q-table saved to: {model_path}")
@@ -262,16 +304,14 @@ def train(
 
 
 def rollout_to_gif(
+    env: gym.Env,
     q_table: np.ndarray,
-    map_name: str,
-    is_slippery: bool,
     gif_path: Path,
     max_steps: int,
     fps: int,
     seed: int,
 ) -> None:
     """Run one greedy episode and save frames as GIF."""
-    env = build_env(map_name=map_name, is_slippery=is_slippery, render_mode="rgb_array")
     state, _ = env.reset(seed=seed)
 
     frames: list[Image.Image] = []
@@ -281,7 +321,7 @@ def rollout_to_gif(
     if first_frame is not None:
         frames.append(Image.fromarray(first_frame))
 
-    for step in range(1, max_steps + 1):
+    for _ in range(1, max_steps + 1):
         action = greedy_policy(q_table, int(state))
         state, reward, terminated, truncated, _ = env.step(action)
         total_reward += float(reward)
@@ -292,8 +332,6 @@ def rollout_to_gif(
 
         if terminated or truncated:
             break
-
-    env.close()
 
     if not frames:
         raise RuntimeError("No frames captured for GIF generation.")
@@ -311,11 +349,19 @@ def rollout_to_gif(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="FrozenLake Q-learning trainer/evaluator with TensorBoard + GIF export"
+        description="Generic tabular Q-learning (discrete spaces) with TensorBoard + GIF export"
     )
     parser.add_argument("--train", action="store_true", help="Train a new Q-table")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate Q-table")
-    parser.add_argument("--gif", action="store_true", help="Generate a GIF rollout")
+    parser.add_argument("--gif", action="store_true", help="Generate GIF rollout")
+
+    parser.add_argument("--env-id", "--env", dest="env_id", type=str, default=DEFAULT_ENV_ID, help="Gymnasium env id")
+    parser.add_argument(
+        "--env-kwargs",
+        type=str,
+        default='{"map_name":"8x8","is_slippery":true}',
+        help="JSON dict of kwargs for gym.make, e.g. '{\"map_name\":\"8x8\",\"is_slippery\":true}'",
+    )
 
     parser.add_argument("--train-episodes", type=int, default=200_000, help="Training episodes")
     parser.add_argument("--eval-episodes", type=int, default=1_000, help="Evaluation episodes")
@@ -328,75 +374,95 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-epsilon", type=float, default=0.01, help="Final epsilon lower bound")
     parser.add_argument("--decay-rate", type=float, default=0.00005, help="Epsilon decay rate")
 
-    parser.add_argument("--eval-freq", type=int, default=5_000, help="Evaluate every N episodes during training")
-    parser.add_argument(
-        "--checkpoint-freq",
-        type=int,
-        default=20_000,
-        help="Save Q-table checkpoint every N episodes (0 disables)",
-    )
+    parser.add_argument("--eval-freq", type=int, default=5_000, help="Evaluate every N episodes")
+    parser.add_argument("--checkpoint-freq", type=int, default=20_000, help="Checkpoint every N episodes (0 disables)")
+    parser.add_argument("--success-threshold", type=float, default=0.0, help="Episode reward threshold counted as success")
 
-    parser.add_argument("--map-name", type=str, default=DEFAULT_MAP_NAME, help="FrozenLake map name (4x4 or 8x8)")
-    parser.add_argument("--no-slippery", action="store_true", help="Disable slippery dynamics")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH, help="Path to .npy Q-table")
-    parser.add_argument("--gif-path", type=Path, default=DEFAULT_GIF_PATH, help="Path to output GIF")
-    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="TensorBoard log directory")
+    parser.add_argument("--model-path", type=Path, default=None, help="Path to .npy Q-table")
+    parser.add_argument("--gif-path", type=Path, default=None, help="Path to output GIF")
+    parser.add_argument("--log-dir", type=Path, default=None, help="TensorBoard log directory")
     parser.add_argument("--fps", type=int, default=3, help="GIF FPS")
-    return parser.parse_args()
+
+    args = parser.parse_args()
+    if not (args.train or args.evaluate or args.gif):
+        parser.error("Select at least one action: --train and/or --evaluate and/or --gif")
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    is_slippery = not args.no_slippery
+    env_kwargs = parse_env_kwargs(args.env_kwargs)
 
-    if args.train:
-        q_table = train(
-            episodes=args.train_episodes,
-            learning_rate=args.learning_rate,
-            gamma=args.gamma,
-            min_epsilon=args.min_epsilon,
-            max_epsilon=args.max_epsilon,
-            decay_rate=args.decay_rate,
-            max_steps=args.max_steps,
-            map_name=args.map_name,
-            is_slippery=is_slippery,
-            model_path=args.model_path,
-            log_dir=args.log_dir,
-            eval_freq=args.eval_freq,
-            checkpoint_freq=args.checkpoint_freq,
-            eval_episodes=args.eval_episodes,
-            seed=args.seed,
-        )
-    else:
-        q_table = load_q_table(args.model_path)
+    slug = env_slug(args.env_id)
+    model_path = normalize_model_path(args.model_path or Path(f"models/qtable_{slug}.npy"))
+    gif_path = args.gif_path or Path(f"videos/{slug}_test.gif")
+    log_dir = args.log_dir or Path(f"logs/q_learning/{slug}")
 
-    if args.evaluate:
-        mean_reward, std_reward, success_rate, mean_ep_len = evaluate_agent(
-            q_table=q_table,
-            map_name=args.map_name,
-            is_slippery=is_slippery,
-            max_steps=args.max_steps,
-            episodes=args.eval_episodes,
-            seed=args.seed + 1000,
-        )
-        print(
-            "Evaluation -> "
-            f"mean_reward: {mean_reward:.4f}, std_reward: {std_reward:.4f}, "
-            f"success_rate: {success_rate:.4f}, mean_ep_len: {mean_ep_len:.2f}"
-        )
+    train_env = None
+    eval_env = None
+    gif_env = None
+    try:
+        if args.train:
+            train_env = build_env(args.env_id, env_kwargs)
+            eval_env = build_env(args.env_id, env_kwargs)
+            q_table = train(
+                env=train_env,
+                eval_env=eval_env,
+                env_id=args.env_id,
+                env_kwargs=env_kwargs,
+                episodes=args.train_episodes,
+                learning_rate=args.learning_rate,
+                gamma=args.gamma,
+                min_epsilon=args.min_epsilon,
+                max_epsilon=args.max_epsilon,
+                decay_rate=args.decay_rate,
+                max_steps=args.max_steps,
+                model_path=model_path,
+                log_dir=log_dir,
+                eval_freq=args.eval_freq,
+                checkpoint_freq=args.checkpoint_freq,
+                eval_episodes=args.eval_episodes,
+                seed=args.seed,
+                success_threshold=args.success_threshold,
+            )
+        else:
+            q_table = load_q_table(model_path)
 
-    if args.gif:
-        rollout_to_gif(
-            q_table=q_table,
-            map_name=args.map_name,
-            is_slippery=is_slippery,
-            gif_path=args.gif_path,
-            max_steps=args.max_steps,
-            fps=args.fps,
-            seed=args.seed,
-        )
+        if args.evaluate:
+            if eval_env is None:
+                eval_env = build_env(args.env_id, env_kwargs)
+            validate_q_table_shape(q_table, eval_env)
+
+            mean_reward, std_reward, success_rate, mean_ep_len = evaluate_agent(
+                env=eval_env,
+                q_table=q_table,
+                max_steps=args.max_steps,
+                episodes=args.eval_episodes,
+                seed=args.seed + 1000,
+                success_threshold=args.success_threshold,
+            )
+            print(
+                "Evaluation -> "
+                f"mean_reward: {mean_reward:.4f}, std_reward: {std_reward:.4f}, "
+                f"success_rate: {success_rate:.4f}, mean_ep_len: {mean_ep_len:.2f}"
+            )
+
+        if args.gif:
+            gif_env = build_env(args.env_id, env_kwargs, render_mode="rgb_array")
+            validate_q_table_shape(q_table, gif_env)
+            rollout_to_gif(
+                env=gif_env,
+                q_table=q_table,
+                gif_path=gif_path,
+                max_steps=args.max_steps,
+                fps=args.fps,
+                seed=args.seed,
+            )
+    finally:
+        for env in [train_env, eval_env, gif_env]:
+            if env is not None:
+                env.close()
 
 
 if __name__ == "__main__":
@@ -406,68 +472,44 @@ if __name__ == "__main__":
 # -----------------------------------------------------------------------------
 # QUICK RUN / TEST COMMANDS (uv)
 # -----------------------------------------------------------------------------
-# Train (saves Q-table + logs):
-#   uv run python3 q-learning.py --train
+# FrozenLake (8x8 slippery):
+#   uv run python3 q-learning.py --env-id FrozenLake-v1 \
+#     --env-kwargs '{"map_name":"8x8","is_slippery":true}' --train
 #
-# Train with custom setup:
-#   uv run python3 q-learning.py --train --train-episodes 300000 --map-name 8x8
+# Taxi:
+#   uv run python3 q-learning.py --env-id Taxi-v3 --env-kwargs '{}' --train
 #
-# Evaluate saved Q-table:
-#   uv run python3 q-learning.py --evaluate --eval-episodes 1000
+# Evaluate + GIF (any supported discrete env):
+#   uv run python3 q-learning.py --env-id Taxi-v3 --evaluate --gif
 #
-# Generate GIF test rollout:
-# (requires a trained model at models/qtable_frozenlake.npy)
-#   uv run python3 q-learning.py --gif
-#
-# Train and then immediately generate GIF:
-#   uv run python3 q-learning.py --train --gif
-#
-# Evaluate + GIF in one run:
-#   uv run python3 q-learning.py --evaluate --gif
-#
-# TensorBoard (install if missing):
+# TensorBoard:
 #   uv add torch tensorboard
 #   uv pip install 'setuptools<70'
-#   uv run tensorboard --logdir logs/frozenlake_qlearning --port 6006
+#   uv run tensorboard --logdir logs/q_learning --port 6006
 # Then open: http://localhost:6006
 
 
 # -----------------------------------------------------------------------------
-# TENSORBOARD METRICS CHEAT-SHEET (Q-learning)
+# TENSORBOARD METRICS CHEAT-SHEET (generic Q-learning)
 # -----------------------------------------------------------------------------
 # train/episode_reward
-#   Reward achieved in each training episode (0 or 1 on FrozenLake).
-#
+#   Reward in each training episode.
 # train/reward_mean_100
-#   Rolling mean reward over last 100 episodes.
-#   Main trend for gradual learning quality.
-#
+#   Rolling mean reward across last 100 episodes.
 # train/success
-#   Episode success flag (1 if goal reached, else 0).
-#
+#   1 if episode reward >= --success-threshold else 0.
 # train/success_rate_100
-#   Rolling success rate over last 100 episodes.
-#   Very useful for sparse-reward tasks like FrozenLake.
-#
+#   Rolling success ratio over last 100 episodes.
 # train/epsilon
-#   Exploration probability. Starts high, decays over time.
-#
+#   Exploration probability (epsilon-greedy).
 # train/td_error_mean
-#   Mean absolute TD error in episode.
-#   Should generally reduce as values become consistent.
-#
+#   Mean absolute TD error in the episode.
 # train/q_value_mean, train/q_value_max
-#   Magnitude/trend of learned Q-values.
-#
-# train/episode_length
-#   Steps taken per episode. Interpret with reward/success trends.
-#
+#   Learned Q-table magnitude trends.
 # eval/mean_reward, eval/std_reward
-#   Performance from periodic greedy evaluation runs.
-#
+#   Periodic evaluation quality metrics.
 # eval/success_rate
-#   Evaluation success ratio. Best quality indicator.
-#
+#   Evaluation success ratio.
 # eval/mean_episode_length
-#   Average evaluation episode length.
+#   Average episode length during eval.
 # -----------------------------------------------------------------------------
