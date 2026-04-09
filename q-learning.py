@@ -1,9 +1,3 @@
-"""Generic tabular Q-learning trainer/evaluator with TensorBoard + GIF export.
-
-Works for discrete-state/discrete-action Gymnasium environments
-(example: FrozenLake-v1, Taxi-v3).
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -17,9 +11,6 @@ import numpy as np
 from PIL import Image
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
-
-
-DEFAULT_ENV_ID = "FrozenLake-v1"
 
 
 def env_slug(env_id: str) -> str:
@@ -94,7 +85,6 @@ def evaluate_agent(
     q_table: np.ndarray,
     max_steps: int,
     episodes: int,
-    seed: int,
     success_threshold: float,
 ) -> tuple[float, float, float, float]:
     """Evaluate greedy policy and return mean/std reward, success rate, mean episode length."""
@@ -103,7 +93,7 @@ def evaluate_agent(
     lengths: list[int] = []
 
     for ep in range(episodes):
-        state, _ = env.reset(seed=seed + ep)
+        state, _ = env.reset(seed=ep)
         total_reward = 0.0
 
         for step in range(1, max_steps + 1):
@@ -174,7 +164,6 @@ def train(
     eval_freq: int,
     checkpoint_freq: int,
     eval_episodes: int,
-    seed: int,
     success_threshold: float,
 ) -> np.ndarray:
     """Train Q-learning agent with TensorBoard tracking."""
@@ -186,7 +175,7 @@ def train(
     log_dir.mkdir(parents=True, exist_ok=True)
 
     writer = SummaryWriter(log_dir=str(log_dir))
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(0)
 
     reward_window: list[float] = []
     success_window: list[float] = []
@@ -196,7 +185,7 @@ def train(
     for episode in pbar:
         epsilon = min_epsilon + (max_epsilon - min_epsilon) * np.exp(-decay_rate * (episode - 1))
 
-        state, _ = env.reset(seed=seed + episode)
+        state, _ = env.reset(seed=episode)
         total_reward = 0.0
         td_errors: list[float] = []
 
@@ -253,7 +242,6 @@ def train(
                 q_table=q_table,
                 max_steps=max_steps,
                 episodes=eval_episodes,
-                seed=seed + 10_000,
                 success_threshold=success_threshold,
             )
             writer.add_scalar("eval/mean_reward", mean_reward, episode)
@@ -293,7 +281,7 @@ def train(
             "max_epsilon": max_epsilon,
             "decay_rate": decay_rate,
             "max_steps": max_steps,
-            "seed": seed,
+            "seed": 0,
             "success_threshold": success_threshold,
         },
     )
@@ -309,10 +297,9 @@ def rollout_to_gif(
     gif_path: Path,
     max_steps: int,
     fps: int,
-    seed: int,
 ) -> None:
     """Run one greedy episode and save frames as GIF."""
-    state, _ = env.reset(seed=seed)
+    state, _ = env.reset(seed=0)
 
     frames: list[Image.Image] = []
     total_reward = 0.0
@@ -355,7 +342,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evaluate", action="store_true", help="Evaluate Q-table")
     parser.add_argument("--gif", action="store_true", help="Generate GIF rollout")
 
-    parser.add_argument("--env-id", "--env", dest="env_id", type=str, default=DEFAULT_ENV_ID, help="Gymnasium env id")
+    parser.add_argument("--env-id", "--env", dest="env_id", type=str, default="FrozenLake-v1", help="Gymnasium env id")
     parser.add_argument(
         "--env-kwargs",
         type=str,
@@ -378,7 +365,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-freq", type=int, default=20_000, help="Checkpoint every N episodes (0 disables)")
     parser.add_argument("--success-threshold", type=float, default=0.0, help="Episode reward threshold counted as success")
 
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--model-path", type=Path, default=None, help="Path to .npy Q-table")
     parser.add_argument("--gif-path", type=Path, default=None, help="Path to output GIF")
     parser.add_argument("--log-dir", type=Path, default=None, help="TensorBoard log directory")
@@ -423,7 +409,6 @@ def main() -> None:
                 eval_freq=args.eval_freq,
                 checkpoint_freq=args.checkpoint_freq,
                 eval_episodes=args.eval_episodes,
-                seed=args.seed,
                 success_threshold=args.success_threshold,
             )
         else:
@@ -439,7 +424,6 @@ def main() -> None:
                 q_table=q_table,
                 max_steps=args.max_steps,
                 episodes=args.eval_episodes,
-                seed=args.seed + 1000,
                 success_threshold=args.success_threshold,
             )
             print(
@@ -456,8 +440,7 @@ def main() -> None:
                 q_table=q_table,
                 gif_path=gif_path,
                 max_steps=args.max_steps,
-                fps=args.fps,
-                seed=args.seed,
+                fps=args.fps
             )
     finally:
         for env in [train_env, eval_env, gif_env]:
@@ -470,17 +453,16 @@ if __name__ == "__main__":
 
 
 # -----------------------------------------------------------------------------
-# QUICK RUN / TEST COMMANDS (uv)
+# QUICK RUN / TEST COMMANDS
 # -----------------------------------------------------------------------------
 # FrozenLake (8x8 slippery):
-#   uv run python3 q-learning.py --env-id FrozenLake-v1 \
-#     --env-kwargs '{"map_name":"8x8","is_slippery":true}' --train
+#   python3 q-learning.py --env-id FrozenLake-v1 --env-kwargs '{"map_name":"8x8","is_slippery":true}' --train
 #
 # Taxi:
-#   uv run python3 q-learning.py --env-id Taxi-v3 --env-kwargs '{}' --train
+#   python3 q-learning.py --env-id Taxi-v3 --env-kwargs '{}' --train --gif --train-episodes 100_000
 #
 # Evaluate + GIF (any supported discrete env):
-#   uv run python3 q-learning.py --env-id Taxi-v3 --evaluate --gif
+#   python3 q-learning.py --env-id Taxi-v3 --evaluate --gif
 #
 # TensorBoard:
 #   uv add torch tensorboard
@@ -490,7 +472,7 @@ if __name__ == "__main__":
 
 
 # -----------------------------------------------------------------------------
-# TENSORBOARD METRICS CHEAT-SHEET (generic Q-learning)
+# TENSORBOARD METRICS (generic Q-learning)
 # -----------------------------------------------------------------------------
 # train/episode_reward
 #   Reward in each training episode.
